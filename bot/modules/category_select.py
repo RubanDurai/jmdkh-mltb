@@ -1,109 +1,102 @@
-from time import time
+from pyrogram.filters import command, regex
+from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 
-from telegram.ext import CallbackQueryHandler, CommandHandler
-
-from bot import (CATEGORY_NAMES, btn_listener, dispatcher, download_dict,
+from bot import (bot, cached_dict, categories_dict, download_dict,
                  download_dict_lock)
-from bot.helper.ext_utils.bot_utils import (MirrorStatus, get_category_btns,
-                                            getDownloadByGid, new_thread)
+from bot.helper.ext_utils.bot_utils import (MirrorStatus, arg_parser,
+                                            getDownloadByGid, is_gdrive_link,
+                                            new_task, sync_to_async)
+from bot.helper.ext_utils.help_messages import CATEGORY_HELP_MESSAGE
+from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
 from bot.helper.telegram_helper.bot_commands import BotCommands
 from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.message_utils import (anno_checker,
-                                                      editMessage, sendMessage)
+                                                      editMessage, isAdmin,
+                                                      open_category_btns,
+                                                      request_limiter,
+                                                      sendMessage)
 
 
-def change_category(update, context):
-    message = update.message
-    if message.from_user.id in [1087968824, 136817688]:
-        message.from_user.id = anno_checker(message)
-        if not message.from_user.id:
-            return
+async def change_category(client, message):
+    if not message.from_user:
+        message.from_user = await anno_checker(message)
+    if not message.from_user:
+        return
     user_id = message.from_user.id
-    if len(context.args) == 1:
-        gid = context.args[0]
-        dl = getDownloadByGid(gid)
-        if not dl:
-            sendMessage(f"GID: <code>{gid}</code> Not Found.", context.bot, message)
-            return
-    elif message.reply_to_message:
-        mirror_message = message.reply_to_message
-        with download_dict_lock:
-            if mirror_message.message_id in download_dict:
-                dl = download_dict[mirror_message.message_id]
-            else:
-                dl = None
-        if not dl:
-            sendMessage("This is not an active task!", context.bot, message)
-            return
-    elif len(context.args) == 0:
-        msg = "Reply to an active /{cmd} which was used to start the download or add gid along with {cmd}\n\n" \
-            "This command mainly for change category incase you decided to change category from already added donwload. " \
-            "But you can always use /{mir} with to select category before download start."
-        sendMessage(msg.format_map({'cmd': BotCommands.CategorySelect,'mir': BotCommands.MirrorCommand[0]}), context.bot, message)
+    if not await isAdmin(message, user_id) and await request_limiter(message):
         return
 
-    if not CustomFilters.owner_query(user_id) and dl.message.from_user.id != user_id:
-        sendMessage("This task is not for you!", context.bot, message)
+    text = message.text.split('\n')
+    input_list = text[0].split(' ')
+
+    arg_base = {'link': '', '-id': '', '-index': ''}
+
+    args = arg_parser(input_list[1:], arg_base)
+
+    drive_id = args['-id']
+    index_link = args['-index']
+
+    if drive_id and is_gdrive_link(drive_id):
+        drive_id = GoogleDriveHelper.getIdFromUrl(drive_id)
+
+    dl = None
+    if gid := args['link']:
+        dl = await getDownloadByGid(gid)
+        if not dl:
+            await sendMessage(message, f"GID: <code>{gid}</code> Not Found.")
+            return
+    if reply_to := message.reply_to_message:
+        async with download_dict_lock:
+            dl = download_dict.get(reply_to.id, None)
+        if not dl:
+            await sendMessage(message, "This is not an active task!")
+            return
+    if not dl:
+        await sendMessage(message, CATEGORY_HELP_MESSAGE.format(cmd=BotCommands.CategorySelect, mir=BotCommands.MirrorCommand[0]))
+        return
+    if not await CustomFilters.sudo(client, message) and dl.message.from_user.id != user_id:
+        await sendMessage(message, "This task is not for you!")
         return
     if dl.status() not in [MirrorStatus.STATUS_DOWNLOADING, MirrorStatus.STATUS_PAUSED, MirrorStatus.STATUS_QUEUEDL]:
-        sendMessage(f'Task should be on {MirrorStatus.STATUS_DOWNLOADING} or {MirrorStatus.STATUS_PAUSED} or {MirrorStatus.STATUS_QUEUEDL}', context.bot, message)
+        await sendMessage(message, f'Task should be on {MirrorStatus.STATUS_DOWNLOADING} or {MirrorStatus.STATUS_PAUSED} or {MirrorStatus.STATUS_QUEUEDL}')
         return
     listener = dl.listener() if dl and hasattr(dl, 'listener') else None
-    if listener:
-        listener.selectCategory()
+    if listener and not listener.isLeech:
+        if not index_link and not drive_id and categories_dict:
+            drive_id, index_link = await open_category_btns(message)
+        if not index_link and not drive_id:
+            return await sendMessage(message, "Time out")
+        msg = '<b>Task has been Updated Successfully!</b>'
+        if drive_id:
+            if not (folder_name := await sync_to_async(GoogleDriveHelper().getFolderData, drive_id)):
+                return await sendMessage(message, "Google Drive id validation failed!!")
+            if listener.drive_id and listener.drive_id == drive_id:
+                msg += f'\n\n<b>Folder name</b> : {folder_name} Already selected'
+            else:
+                msg += f'\n\n<b>Folder name</b> : {folder_name}'
+            listener.drive_id = drive_id
+        if index_link:
+            listener.index_link = index_link
+            msg += f'\n\n<b>Index Link</b> : <code>{index_link}</code>'
+        return await sendMessage(message, msg)
     else:
-        sendMessage("Can not change Category for this task!", context.bot, message)
+        await sendMessage(message, "Can not change Category for this task!")
 
-@new_thread
-def confirm_category(update, context):
-    query = update.callback_query
+
+@new_task
+async def confirm_category(client, query):
     user_id = query.from_user.id
-    message = query.message
-    data = query.data
-    data = data.split()
+    data = query.data.split(maxsplit=3)
     msg_id = int(data[2])
-    try:
-        categoryInfo = btn_listener[msg_id]
-    except KeyError:
-        return editMessage('<b>Old Task</b>', message)
-    listener = categoryInfo[2]
-    if user_id != listener.message.from_user.id and not CustomFilters.owner_query(user_id):
-        query.answer("This task is not for you!", show_alert=True)
-    elif data[1] == 'scat':
-        c_index = int(data[3])
-        if listener.c_index == c_index:
-            return query.answer(f"{CATEGORY_NAMES[c_index]} is Selected Already", show_alert=True)
-        query.answer()
-        listener.c_index = c_index
-    elif data[1] == 'cancel':
-        query.answer()
-        listener.c_index = categoryInfo[3]
-        mode = f'Drive {CATEGORY_NAMES[listener.c_index]}'
-        if listener.isZip:
-            mode += ' as Zip'
-        elif listener.extract:
-            mode += ' as Unzip'
-        listener.mode = mode
-        del btn_listener[msg_id]
-        return editMessage("<b>Has been cancelled</b>", message)
-    elif data[1] == 'done':
-        query.answer()
-        del btn_listener[msg_id]
-        mode = f'Drive {CATEGORY_NAMES[listener.c_index]}'
-        if listener.isZip:
-            mode += ' as Zip'
-        elif listener.extract:
-            mode += ' as Unzip'
-        listener.mode = mode
-        message.delete()
-        return
-    time_out = categoryInfo[0] - (time() - categoryInfo[1])
-    text, btns = get_category_btns(time_out, msg_id, listener.c_index)
-    editMessage(text, message, btns)
+    if msg_id not in cached_dict:
+        return await editMessage(query.message, '<b>Old Task</b>')
+    if user_id != int(data[1]) and not await CustomFilters.sudo(client, query):
+        return await query.answer(text="This task is not for you!", show_alert=True)
+    await query.answer()
+    cached_dict[msg_id][0] = categories_dict[data[3]].get('drive_id')
+    cached_dict[msg_id][1] = categories_dict[data[3]].get('index_link')
 
-confirm_category_handler = CallbackQueryHandler(confirm_category, pattern="change")
 
-change_category_handler = CommandHandler(BotCommands.CategorySelect, change_category,
-                        filters=(CustomFilters.authorized_chat | CustomFilters.authorized_user))
-dispatcher.add_handler(confirm_category_handler)
-dispatcher.add_handler(change_category_handler)
+bot.add_handler(MessageHandler(change_category, filters=command(
+    BotCommands.CategorySelect) & CustomFilters.authorized))
+bot.add_handler(CallbackQueryHandler(confirm_category, filters=regex("^scat")))
